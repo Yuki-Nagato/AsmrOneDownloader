@@ -19,7 +19,7 @@
 				Console.WriteLine("Fetching RJ{0}...", rjcode);
 
 				Downloader downloader = new Downloader(rjcode);
-				DirectoryInfo baseDir = Directory.CreateDirectory("RJ" + rjcode);
+				DirectoryInfo baseDir = new DirectoryInfo("RJ" + rjcode);
 				await downloader.UpdateToDirectory(baseDir);
 			}
 		}
