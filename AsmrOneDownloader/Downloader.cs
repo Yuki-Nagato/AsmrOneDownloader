@@ -1,8 +1,11 @@
 ﻿using Newtonsoft.Json;
+using ShellProgressBar;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net.Http.Headers;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
@@ -66,45 +69,99 @@ namespace AsmrOneDownloader {
 			return result;
 		}
 
+		async Task<Tuple<long, string, HttpResponseMessage>> FetchContentLengthAndEtagAsync(string url, bool enforceGet) {
+			long? contentLength = null;
+			string? etag = null;
+
+			if (enforceGet) {
+				// GET and HEAD
+				var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+				if (resp.Content.Headers.ContentLength != null) {
+					contentLength = resp.Content.Headers.ContentLength;
+				}
+				if (resp.Headers.ETag != null) {
+					etag = resp.Headers.ETag.Tag;
+					etag = etag.Split('"')[1];
+				}
+				if (contentLength != null && etag != null) {
+					return Tuple.Create((long)contentLength, etag, resp);
+				}
+				var headResp = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, url), HttpCompletionOption.ResponseHeadersRead);
+				if (headResp.Content.Headers.ContentLength != null) {
+					contentLength = headResp.Content.Headers.ContentLength;
+				}
+				if (headResp.Headers.ETag != null) {
+					etag = headResp.Headers.ETag.Tag;
+					etag = etag.Split('"')[1];
+				}
+				return Tuple.Create(contentLength ?? throw new NullReferenceException(), etag ?? throw new NullReferenceException(), resp);
+			}
+			else {
+				// HEAD and GET
+				var headResp = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, url), HttpCompletionOption.ResponseHeadersRead);
+				if (headResp.Content.Headers.ContentLength != null) {
+					contentLength = headResp.Content.Headers.ContentLength;
+				}
+				if (headResp.Headers.ETag != null) {
+					etag = headResp.Headers.ETag.Tag;
+					etag = etag.Split('"')[1];
+				}
+				if (contentLength != null && etag != null) {
+					return Tuple.Create((long)contentLength, etag, headResp);
+				}
+				var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+				if (resp.Content.Headers.ContentLength != null) {
+					contentLength = resp.Content.Headers.ContentLength;
+				}
+				if (resp.Headers.ETag != null) {
+					etag = resp.Headers.ETag.Tag;
+					etag = etag.Split('"')[1];
+				}
+				return Tuple.Create(contentLength ?? throw new NullReferenceException(), etag ?? throw new NullReferenceException(), resp);
+			}
+		}
+
 		async Task<bool> CheckFileIntegrityAsync(FileInfo file, string url) {
 			byte[] fileBytes = File.ReadAllBytes(file.FullName);
-			var resp = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, url));
-			long respLength = resp.Content.Headers.ContentLength ?? throw new NullReferenceException();
-			if (fileBytes.LongLength != respLength) {
-				return false;
-			}
-			if (resp.Headers.ETag != null) {
-				string etag = resp.Headers.ETag.Tag[(resp.Headers.ETag.Tag.IndexOf('"') + 1)..resp.Headers.ETag.Tag.LastIndexOf('"')];
-				byte[] etagBytes = Convert.FromHexString(etag);
-				using MD5 md5Obj = MD5.Create();
-				byte[] md5Hash = md5Obj.ComputeHash(fileBytes);
-				if (!etagBytes.SequenceEqual(md5Hash)) {
-					return false;
-				}
-			}
-			return true;
+			var (respLen, respEtag, resp) = await FetchContentLengthAndEtagAsync(url, false);
+			return CheckFileIntegrity(fileBytes, respLen, respEtag);
 		}
 
-		bool CheckFileIntegrity(byte[] fileBytes, HttpResponseMessage resp) {
-			long respLength = resp.Content.Headers.ContentLength ?? throw new NullReferenceException();
-			if (fileBytes.LongLength != respLength) {
+		bool CheckFileIntegrity(byte[] fileBytes, long respLen, string respEtag) {
+			if (fileBytes.LongLength != respLen) {
 				return false;
 			}
-			if (resp.Headers.ETag != null) {
-				string etag = resp.Headers.ETag.Tag[(resp.Headers.ETag.Tag.IndexOf('"') + 1)..resp.Headers.ETag.Tag.LastIndexOf('"')];
-				byte[] etagBytes = Convert.FromHexString(etag);
-				using MD5 md5Obj = MD5.Create();
-				byte[] md5Hash = md5Obj.ComputeHash(fileBytes);
-				if (!etagBytes.SequenceEqual(md5Hash)) {
-					return false;
-				}
-			}
-			return true;
+			byte[] etagBytes = Convert.FromHexString(respEtag);
+			using MD5 md5Obj = MD5.Create();
+			byte[] md5Hash = md5Obj.ComputeHash(fileBytes);
+			return etagBytes.SequenceEqual(md5Hash);
 		}
 
+		string NumberToUnit(double num) {
+			string[] prefixes = { "", "K", "M", "G", "T" };
+			int i;
+			for (i = 0; i < prefixes.Length - 1; i++) {
+				if (num < 1024) {
+					break;
+				}
+				num /= 1024;
+			}
+			return num.ToString("F2") + " " + prefixes[i];
+		}
 
 		public async Task UpdateToDirectory(DirectoryInfo baseDir) {
-			SortedDictionary<string, string> tracks = await GetTracks();
+			SortedDictionary<string, string> tracks;
+			while (true) {
+				try {
+					tracks = await GetTracks();
+					break;
+				}
+				catch (Exception ex) {
+					Console.WriteLine(ex);
+					Console.WriteLine("Retry after 10 seconds.");
+					await Task.Delay(10 * 1000);
+				}
+			}
 			Console.WriteLine("There are {0} files to download.", tracks.Count);
 			int i = 0;
 			foreach (var (path, url) in tracks) {
@@ -119,21 +176,32 @@ namespace AsmrOneDownloader {
 								break;
 							}
 						}
-						var resp = await client.GetAsync(url);
-						byte[] content = await resp.Content.ReadAsByteArrayAsync();
-						if (!CheckFileIntegrity(content, resp)) {
+						var (respLen, respEtag, resp) = await FetchContentLengthAndEtagAsync(url, true);
+						byte[] content = new byte[respLen];
+						//Console.WriteLine();
+						using (ProgressBar pbar = new ProgressBar(content.Length, $"Downloading", new ProgressBarOptions() { ForegroundColorDone = ConsoleColor.Gray, ShowEstimatedDuration = true })) {
+							Stream stream = resp.Content.ReadAsStream();
+							int len, p = 0;
+							Stopwatch stopwatch = new Stopwatch();
+							stopwatch.Start();
+							while ((len = stream.Read(content, p, content.Length - p)) > 0) {
+								p += len;
+								long tick = stopwatch.ElapsedTicks;
+								double bpersec = (double)(p * Stopwatch.Frequency) / tick;
+								pbar.Tick(p, TimeSpan.FromSeconds((content.Length - p) / bpersec), $"{NumberToUnit(bpersec)}B/s");
+							}
+						}
+						if (!CheckFileIntegrity(content, respLen, respEtag)) {
 							throw new Exception("Downloaded file is corrupted.");
 						}
-						if (file.Directory != null) {
-							file.Directory.Create();
-						}
+						file.Directory?.Create();
 						File.WriteAllBytes(file.FullName, content);
 						break;
 					}
 					catch (Exception ex) {
 						Console.WriteLine(ex);
 						Console.WriteLine("Retry after 10 seconds.");
-						Thread.Sleep(10 * 1000);
+						await Task.Delay(10 * 1000);
 					}
 				}
 			}
