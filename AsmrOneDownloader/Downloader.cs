@@ -1,4 +1,5 @@
 ﻿using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using ShellProgressBar;
 using System;
 using System.Collections.Generic;
@@ -36,34 +37,61 @@ namespace AsmrOneDownloader {
 			return 0;
 		}
 	}
-	internal class Downloader {
-		string code;
+	public class Downloader {
 		HttpClient client;
+		private string? username, password, token;
 
-		public Downloader(string code) {
-			this.code = code ?? throw new ArgumentNullException(nameof(code));
+		public Downloader() {
 			client = new HttpClient(new SocketsHttpHandler() { ConnectTimeout = TimeSpan.FromSeconds(30) }) { Timeout = Timeout.InfiniteTimeSpan };
 		}
 
-		string EscapeFilename(string filename) {
+		public async Task LoginAsync(string username, string password) {
+			var resp = await client.PostAsync("https://api.asmr.one/api/auth/me", new StringContent(JsonConvert.SerializeObject(new { name = username, password = password }, Formatting.None), Encoding.UTF8, "application/json"));
+			resp.EnsureSuccessStatusCode();
+			string respStr = await resp.Content.ReadAsStringAsync();
+			JObject respObj = JObject.Parse(respStr);
+			string token = respObj["token"]?.Value<string>() ?? throw new ArgumentNullException(nameof(token));
+			this.username = username;
+			this.password = password;
+			this.token = token;
+			client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+		}
+
+		public async Task LogoutAsync() {
+			var resp = await client.GetAsync("https://api.asmr.one/api/auth/reg", HttpCompletionOption.ResponseContentRead);
+			resp.EnsureSuccessStatusCode();
+			client.DefaultRequestHeaders.Authorization = null;
+			this.username = null;
+			this.password = null;
+			this.token = null;
+		}
+
+		public static string EscapeFilename(string filename) {
 			return string.Join("_", filename.Split(Path.GetInvalidFileNameChars()));
 		}
 
 		void DfsTracks(List<TrackObject> tracks, string dir, SortedDictionary<string, string> result) {
 			foreach (TrackObject track in tracks) {
 				if (track.Type == "folder") {
-					DfsTracks(track.Children ?? throw new NullReferenceException(), dir + EscapeFilename(track.Title) + "/", result);
+					DfsTracks(track.Children ?? throw new ArgumentNullException(nameof(track.Children)), dir + EscapeFilename(track.Title) + "/", result);
 				}
 				else {
-					result[dir + EscapeFilename(track.Title)] = track.MediaDownloadUrl ?? throw new NullReferenceException();
+					result[dir + EscapeFilename(track.Title)] = track.MediaDownloadUrl ?? throw new ArgumentNullException(nameof(track.MediaDownloadUrl));
 				}
 			}
 		}
 
-		async Task<SortedDictionary<string, string>> GetTracks() {
+		public async Task<WorkObject> GetWorkAsync(string code) {
+			var resp = await client.GetAsync("https://api.asmr.one/api/work/" + code);
+			string respStr = await resp.Content.ReadAsStringAsync();
+			WorkObject work = JsonConvert.DeserializeObject<WorkObject>(respStr) ?? throw new ArgumentNullException(nameof(work));
+			return work;
+		}
+
+		async Task<SortedDictionary<string, string>> GetTracksAsync(string code) {
 			var resp = await client.GetAsync("https://api.asmr.one/api/tracks/" + code);
 			string respStr = await resp.Content.ReadAsStringAsync();
-			List<TrackObject> tracks = JsonConvert.DeserializeObject<List<TrackObject>>(respStr) ?? throw new NullReferenceException();
+			List<TrackObject> tracks = JsonConvert.DeserializeObject<List<TrackObject>>(respStr) ?? throw new ArgumentNullException(nameof(tracks));
 			SortedDictionary<string, string> result = new SortedDictionary<string, string>(new PathComparer());
 			DfsTracks(tracks, "", result);
 			return result;
@@ -94,7 +122,7 @@ namespace AsmrOneDownloader {
 					etag = headResp.Headers.ETag.Tag;
 					etag = etag.Split('"')[1];
 				}
-				return Tuple.Create(contentLength ?? throw new NullReferenceException(), etag ?? throw new NullReferenceException(), resp);
+				return Tuple.Create(contentLength ?? throw new ArgumentNullException(nameof(contentLength)), etag ?? throw new ArgumentNullException(nameof(etag)), resp);
 			}
 			else {
 				// HEAD and GET
@@ -117,7 +145,7 @@ namespace AsmrOneDownloader {
 					etag = resp.Headers.ETag.Tag;
 					etag = etag.Split('"')[1];
 				}
-				return Tuple.Create(contentLength ?? throw new NullReferenceException(), etag ?? throw new NullReferenceException(), resp);
+				return Tuple.Create(contentLength ?? throw new ArgumentNullException(nameof(contentLength)), etag ?? throw new ArgumentNullException(nameof(etag)), resp);
 			}
 		}
 
@@ -127,7 +155,7 @@ namespace AsmrOneDownloader {
 			return CheckFileIntegrity(fileBytes, respLen, respEtag);
 		}
 
-		bool CheckFileIntegrity(byte[] fileBytes, long respLen, string respEtag) {
+		static bool CheckFileIntegrity(byte[] fileBytes, long respLen, string respEtag) {
 			if (fileBytes.LongLength != respLen) {
 				return false;
 			}
@@ -137,7 +165,7 @@ namespace AsmrOneDownloader {
 			return etagBytes.SequenceEqual(md5Hash);
 		}
 
-		string NumberToUnit(double num) {
+		static string NumberToUnit(double num) {
 			string[] prefixes = { "", "K", "M", "G", "T" };
 			int i;
 			for (i = 0; i < prefixes.Length - 1; i++) {
@@ -146,14 +174,18 @@ namespace AsmrOneDownloader {
 				}
 				num /= 1024;
 			}
-			return num.ToString("F2") + " " + prefixes[i];
+			string numStr = num.ToString("F2");
+			while (numStr.EndsWith('.') || numStr.Contains('.') && numStr.Length > 4) {
+				numStr = numStr[..^1];
+			}
+			return numStr + " " + prefixes[i];
 		}
 
-		public async Task UpdateToDirectory(DirectoryInfo baseDir) {
+		public async Task DownloadToDirectoryAsync(string code, DirectoryInfo baseDir) {
 			SortedDictionary<string, string> tracks;
 			while (true) {
 				try {
-					tracks = await GetTracks();
+					tracks = await GetTracksAsync(code);
 					break;
 				}
 				catch (Exception ex) {

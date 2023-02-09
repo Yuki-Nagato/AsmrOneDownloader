@@ -1,27 +1,41 @@
 ﻿namespace AsmrOneDownloader {
 	internal class Program {
-		static async Task Main(string[] args) {
-			while (true) {
-				Console.Write("Input RJ code: ");
-				string? rjcode = Console.ReadLine();
-				if (string.IsNullOrWhiteSpace(rjcode)) {
-					Console.WriteLine("Exit.");
-					break;
-				}
-				rjcode = rjcode.Trim().ToUpper();
-				if (rjcode.StartsWith("RJ")) {
-					rjcode = rjcode.Substring(2);
-				}
-				if (rjcode.Any(c => c < '0' || c > '9')) {
-					Console.WriteLine("Wrong formatted RJ code. Enter ### or RJ###.");
-					continue;
-				}
-				Console.WriteLine("Fetching RJ{0}...", rjcode);
+		static async Task<int> Main(string[] args) {
+			Downloader downloader = new Downloader();
 
-				Downloader downloader = new Downloader(rjcode);
-				DirectoryInfo baseDir = new DirectoryInfo("RJ" + rjcode);
-				await downloader.UpdateToDirectory(baseDir);
+			Console.Write("Input username:");
+			string username = Console.ReadLine() ?? throw new ArgumentNullException(nameof(username));
+			Console.Write("Input password:");
+			string password = Console.ReadLine() ?? throw new ArgumentNullException(nameof(password));
+			await downloader.LoginAsync(username, password);
+			Console.WriteLine("Login successfully.");
+
+			Console.Write("Input RJ code, separated by spaces: ");
+			string str = Console.ReadLine() ?? throw new ArgumentNullException(nameof(str));
+
+			string[] codes = str.Split(Array.Empty<char>(), StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(x => x.ToUpper()).ToArray();
+			for(int i=0; i<codes.Length; i++) {
+				if (codes[i].StartsWith("RJ")) {
+					codes[i] = codes[i][2..];
+				}
+				foreach(char ch in codes[i]) {
+					if(ch < '0' || ch > '9') {
+						Console.WriteLine("Wrong formatted RJ code. Enter ### or RJ###.");
+						return 1;
+					}
+				}
 			}
+
+			foreach (string code in codes) {
+				Console.WriteLine("Fetching RJ{0}...", code);
+
+				WorkObject work = await downloader.GetWorkAsync(code);
+				DirectoryInfo baseDir = new DirectoryInfo("RJ" + code + " " + Downloader.EscapeFilename(work.Title));
+				await downloader.DownloadToDirectoryAsync(code, baseDir);
+			}
+
+			Console.WriteLine("All done.");
+			return 0;
 		}
 	}
 }
