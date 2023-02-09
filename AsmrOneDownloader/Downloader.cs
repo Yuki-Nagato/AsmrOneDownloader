@@ -1,5 +1,7 @@
 ﻿using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Polly;
+using Polly.Retry;
 using ShellProgressBar;
 using System;
 using System.Collections.Generic;
@@ -40,6 +42,10 @@ namespace AsmrOneDownloader {
 	public class Downloader {
 		HttpClient client;
 		private string? username, password, token;
+		public static readonly AsyncRetryPolicy Wait10SecondsAndRetryAsyncPolicy = Policy.Handle<Exception>().WaitAndRetryForeverAsync((_) => TimeSpan.FromSeconds(10), onRetry: (ex, _) => {
+			Console.WriteLine(ex);
+			Console.WriteLine("Retry after 10 seconds.");
+		});
 
 		public Downloader() {
 			client = new HttpClient(new SocketsHttpHandler() { ConnectTimeout = TimeSpan.FromSeconds(30) }) { Timeout = Timeout.InfiniteTimeSpan };
@@ -83,6 +89,7 @@ namespace AsmrOneDownloader {
 
 		public async Task<WorkObject> GetWorkAsync(string code) {
 			var resp = await client.GetAsync("https://api.asmr.one/api/work/" + code);
+			resp.EnsureSuccessStatusCode();
 			string respStr = await resp.Content.ReadAsStringAsync();
 			WorkObject work = JsonConvert.DeserializeObject<WorkObject>(respStr) ?? throw new ArgumentNullException(nameof(work));
 			return work;
@@ -90,6 +97,7 @@ namespace AsmrOneDownloader {
 
 		async Task<SortedDictionary<string, string>> GetTracksAsync(string code) {
 			var resp = await client.GetAsync("https://api.asmr.one/api/tracks/" + code);
+			resp.EnsureSuccessStatusCode();
 			string respStr = await resp.Content.ReadAsStringAsync();
 			List<TrackObject> tracks = JsonConvert.DeserializeObject<List<TrackObject>>(respStr) ?? throw new ArgumentNullException(nameof(tracks));
 			SortedDictionary<string, string> result = new SortedDictionary<string, string>(new PathComparer());
@@ -104,6 +112,7 @@ namespace AsmrOneDownloader {
 			if (enforceGet) {
 				// GET and HEAD
 				var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+				resp.EnsureSuccessStatusCode();
 				if (resp.Content.Headers.ContentLength != null) {
 					contentLength = resp.Content.Headers.ContentLength;
 				}
@@ -115,6 +124,7 @@ namespace AsmrOneDownloader {
 					return Tuple.Create((long)contentLength, etag, resp);
 				}
 				var headResp = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, url), HttpCompletionOption.ResponseHeadersRead);
+				headResp.EnsureSuccessStatusCode();
 				if (headResp.Content.Headers.ContentLength != null) {
 					contentLength = headResp.Content.Headers.ContentLength;
 				}
@@ -127,6 +137,7 @@ namespace AsmrOneDownloader {
 			else {
 				// HEAD and GET
 				var headResp = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, url), HttpCompletionOption.ResponseHeadersRead);
+				headResp.EnsureSuccessStatusCode();
 				if (headResp.Content.Headers.ContentLength != null) {
 					contentLength = headResp.Content.Headers.ContentLength;
 				}
@@ -138,6 +149,7 @@ namespace AsmrOneDownloader {
 					return Tuple.Create((long)contentLength, etag, headResp);
 				}
 				var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+				resp.EnsureSuccessStatusCode();
 				if (resp.Content.Headers.ContentLength != null) {
 					contentLength = resp.Content.Headers.ContentLength;
 				}
@@ -181,61 +193,39 @@ namespace AsmrOneDownloader {
 			return numStr + " " + prefixes[i];
 		}
 
-		public async Task DownloadToDirectoryAsync(string code, DirectoryInfo baseDir) {
-			SortedDictionary<string, string> tracks;
-			while (true) {
-				try {
-					tracks = await GetTracksAsync(code);
-					break;
-				}
-				catch (Exception ex) {
-					Console.WriteLine(ex);
-					Console.WriteLine("Retry after 10 seconds.");
-					await Task.Delay(10 * 1000);
-				}
-			}
+		public async Task DownloadToDirectoryWithRetryAsync(string code, DirectoryInfo baseDir) {
+			SortedDictionary<string, string> tracks = await Wait10SecondsAndRetryAsyncPolicy.ExecuteAsync(() => GetTracksAsync(code));
 			Console.WriteLine("There are {0} files to download.", tracks.Count);
 			int i = 0;
 			foreach (var (path, url) in tracks) {
 				++i;
-				while (true) {
-					try {
-						Console.WriteLine("[{0}/{1}] {2}", i, tracks.Count, path);
-						FileInfo file = new FileInfo(Path.Combine(baseDir.FullName, path));
-						if (file.Exists) {
-							if (await CheckFileIntegrityAsync(file, url)) {
-								Console.WriteLine("Already downloaded and checked.");
-								break;
-							}
+				await Wait10SecondsAndRetryAsyncPolicy.ExecuteAsync(async () => {
+					Console.WriteLine("[{0}/{1}] {2}", i, tracks.Count, path);
+					FileInfo file = new FileInfo(Path.Combine(baseDir.FullName, path));
+					if (file.Exists) {
+						if (await CheckFileIntegrityAsync(file, url)) {
+							Console.WriteLine("Already downloaded and checked.");
+							return;
 						}
-						var (respLen, respEtag, resp) = await FetchContentLengthAndEtagAsync(url, true);
-						byte[] content = new byte[respLen];
-						//Console.WriteLine();
-						using (ProgressBar pbar = new ProgressBar(content.Length, $"Downloading", new ProgressBarOptions() { ForegroundColorDone = ConsoleColor.Gray, ShowEstimatedDuration = true })) {
-							Stream stream = resp.Content.ReadAsStream();
-							int len, p = 0;
-							Stopwatch stopwatch = new Stopwatch();
-							stopwatch.Start();
-							while ((len = stream.Read(content, p, content.Length - p)) > 0) {
-								p += len;
-								long tick = stopwatch.ElapsedTicks;
-								double bpersec = (double)(p * Stopwatch.Frequency) / tick;
-								pbar.Tick(p, TimeSpan.FromSeconds((content.Length - p) / bpersec), $"{NumberToUnit(bpersec)}B/s");
-							}
-						}
-						if (!CheckFileIntegrity(content, respLen, respEtag)) {
-							throw new Exception("Downloaded file is corrupted.");
-						}
-						file.Directory?.Create();
-						File.WriteAllBytes(file.FullName, content);
-						break;
 					}
-					catch (Exception ex) {
-						Console.WriteLine(ex);
-						Console.WriteLine("Retry after 10 seconds.");
-						await Task.Delay(10 * 1000);
+					var (respLen, respEtag, resp) = await FetchContentLengthAndEtagAsync(url, true);
+					byte[] content = new byte[respLen];
+					using (ProgressBar pbar = new ProgressBar(content.Length, $"Downloading", new ProgressBarOptions() { ForegroundColorDone = ConsoleColor.Gray, ShowEstimatedDuration = true })) {
+						Stream stream = resp.Content.ReadAsStream();
+						int len, p = 0;
+						DateTimeOffset startTime = DateTimeOffset.Now;
+						while ((len = stream.Read(content, p, content.Length - p)) > 0) {
+							p += len;
+							double bpersec = p / (DateTimeOffset.Now - startTime).TotalSeconds;
+							pbar.Tick(p, TimeSpan.FromSeconds((content.Length - p) / bpersec), $"{NumberToUnit(bpersec)}B/s");
+						}
 					}
-				}
+					if (!CheckFileIntegrity(content, respLen, respEtag)) {
+						throw new Exception("Downloaded file is corrupted.");
+					}
+					file.Directory?.Create();
+					File.WriteAllBytes(file.FullName, content);
+				});
 			}
 		}
 	}
