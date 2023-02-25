@@ -6,6 +6,7 @@ using ShellProgressBar;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
 using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
@@ -178,7 +179,7 @@ namespace AsmrOneDownloader {
 		}
 
 		static string NumberToUnit(double num) {
-			string[] prefixes = { "", "K", "M", "G", "T" };
+			string[] prefixes = { "", "K", "M", "G", "T", "P" };
 			int i;
 			for (i = 0; i < prefixes.Length - 1; i++) {
 				if (num < 1024) {
@@ -186,9 +187,12 @@ namespace AsmrOneDownloader {
 				}
 				num /= 1024;
 			}
-			string numStr = num.ToString("F2");
-			while (numStr.EndsWith('.') || numStr.Contains('.') && numStr.Length > 4) {
-				numStr = numStr[..^1];
+			string numStr = string.Empty;
+			for (int p = 2; p >= 0; p--) {
+				numStr = num.ToString("F" + p, CultureInfo.InvariantCulture);
+				if (numStr.Count(ch => ch is >= '0' and <= '9') <= 3) {
+					break;
+				}
 			}
 			return numStr + " " + prefixes[i];
 		}
